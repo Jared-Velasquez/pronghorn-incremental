@@ -6,16 +6,6 @@ from orchestration.checkpoint import Checkpoint
 
 from minio import Minio
 
-# https://criu.org/index.php?title=Memory_changes_tracking
-# How to track memory changes (pages of 4KB)?
-# Step 1: ask the kernel to keep track of memory changes (by writing 4 into /proc/{pid}/clear_refs file for each 
-# pid we're interested in)
-
-# after a while...
-
-# Step 2: get the list of modified pages of a process by reading its /proc/{pid}/pagemap file and look at the
-# soft-dirty bit in the pagemap entries
-
 # How does this look in MinIO?
 
 # MinIO checkpoints bucket:
@@ -32,6 +22,8 @@ from minio import Minio
 # Checkpoint(path="uuid_B", parent_path="uuid_A"); child of uuid_A
 # Checkpoint(path="uuid_C", parent_path="uuid_B"); child of uuid_B
 
+# ------------------------------------
+
 # Dump Flow:
 
 # First dump: full dump (entries is empty); create a new IncrementalChain
@@ -39,7 +31,9 @@ from minio import Minio
 # ...
 # Sixth dump: full dump (len(entries) = 5 >= max_depth=5); must create a new IncrementalChain
 
-# Restore flow:
+# ------------------------------------
+
+# Restore flow (setup_for_restore):
 
 # How to restore uuid_C? Call setup_for_restore with checkpoint C; it will walk parent_path links
 # to build the chain [C, B, A], then reverse it [A, B, C]

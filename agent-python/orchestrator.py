@@ -269,6 +269,9 @@ def on_container_started() -> "tuple[bool, object]":
 
     print("Orchestrator will checkpoint at %s" % orch.state.request_to_checkpoint)
 
+    incremental = getattr(orch.strategy, "incremental", False)
+    max_chain_depth = getattr(orch.strategy, "max_chain_depth", 5)
+
     if save_state(orch):
         return (
             True,
@@ -277,6 +280,8 @@ def on_container_started() -> "tuple[bool, object]":
                 "from_checkpoint": from_checkpoint,
                 "checkpoint_location": checkpoint_location,
                 "will_checkpoint_at": orch.state.request_to_checkpoint,
+                "incremental": incremental,
+                "max_chain_depth": max_chain_depth,
             },
         )
     else:

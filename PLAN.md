@@ -6,7 +6,7 @@ Pronghorn maintains a pool of CRIU checkpoints at various invocation counts. Cur
 
 ---
 
-## Step 1 (Jared): Fix `IncrementalChain` bugs and gaps
+## Step 1 (Jared, DONE): Fix `IncrementalChain` bugs and gaps
 
 **Why:** The `IncrementalChain` class is the core data structure that manages the chain of parent-to-child checkpoint relationships, constructs CRIU dump/restore commands with the correct incremental flags, and handles uploading/downloading checkpoint files. Without fixing its bugs — broken chain traversal, incomplete file uploads, missing CRIU command builders, and no max-depth enforcement — incremental dumps would either fail to produce valid CRIU images, fail to restore, or grow unbounded chains that degrade restore performance.
 
@@ -52,7 +52,7 @@ CRIU automatically follows `parent` symlinks during restore — no extra flags n
 
 ---
 
-## Step 2 (Jared): Add incremental mode to the configuration/strategy layer
+## Step 2 (Jared, DONE): Add incremental mode to the configuration/strategy layer
 
 **Why:** The strategy configuration system is how the agent learns which orchestration mode to use. Currently, `cr_deserialize` in `utils.py` parses the ENV strategy string to instantiate strategy objects, and `RequestCentricStrategy` serializes/deserializes its parameters across container lifecycles. Neither has any concept of `incremental` or `max_chain_depth`. Without wiring these parameters through the configuration layer, the agent will never know incremental mode is enabled — Steps 1, 3–5 build all the machinery but nothing ever turns it on.
 

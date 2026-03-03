@@ -27,6 +27,8 @@ class RequestCentricStrategy(CRStrategy):
         gamma: float = DEFAULT_GAMMA,
         performance_fn=DEFAULT_PERFORMANCE_FN,
         eps=DEFAULT_EPSILON,
+        incremental: bool = False,
+        max_chain_depth: int = 5,
     ) -> None:
         super().__init__(workload, pool)
         self.max_capacity = max_capacity
@@ -35,6 +37,8 @@ class RequestCentricStrategy(CRStrategy):
         self.performance_fn = performance_fn
         self.weights = np.array([0] * workload.max_requests)
         self.eps = eps
+        self.incremental = incremental
+        self.max_chain_depth = max_chain_depth
 
     @property
     def name(self) -> str:
@@ -159,9 +163,11 @@ class RequestCentricStrategy(CRStrategy):
     @property
     def extra_state(self) -> dict:
         return {
-            "max_capacity": self.max_capacity,  # = max_capacity
-            "p": self.p,  # = p
-            "gamma": self.gamma,  # = gamma
-            "weights": self.weights.tolist(),  # = np.array([0] * workload.max_requests)
-            "eps": self.eps,  # = eps
+            "max_capacity": self.max_capacity,
+            "p": self.p,
+            "gamma": self.gamma,
+            "weights": self.weights.tolist(),
+            "eps": self.eps,
+            "incremental": self.incremental,
+            "max_chain_depth": self.max_chain_depth,
         }
