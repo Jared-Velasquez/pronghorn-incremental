@@ -277,9 +277,11 @@ def on_container_started() -> "tuple[bool, object]":
     if from_checkpoint:
         starting_req_number = checkpoint.state.request_number
         checkpoint_location = checkpoint.path
+        checkpoint_object = checkpoint.serialize()
     else:
         starting_req_number = 0
         checkpoint_location = ""
+        checkpoint_object = None
 
     workload_state = WorkloadState(orch.params, starting_req_number)
 
@@ -291,6 +293,7 @@ def on_container_started() -> "tuple[bool, object]":
 
     incremental = getattr(orch.strategy, "incremental", False)
     max_chain_depth = getattr(orch.strategy, "max_chain_depth", 5)
+    pool = [chkpt.serialize() for chkpt in orch.strategy.pool]
 
     if save_state(orch):
         return (
@@ -299,6 +302,8 @@ def on_container_started() -> "tuple[bool, object]":
                 "success": True,
                 "from_checkpoint": from_checkpoint,
                 "checkpoint_location": checkpoint_location,
+                "checkpoint_object": checkpoint_object,
+                "pool": pool,
                 "will_checkpoint_at": orch.state.request_to_checkpoint,
                 "incremental": incremental,
                 "max_chain_depth": max_chain_depth,
@@ -348,12 +353,17 @@ def on_container_request(latency: float) -> "tuple[bool, object]":
 
 # Returns tuple[success: bool, message: str]
 @exponential_retry
-def on_container_checkpoint(path: str) -> "tuple[bool, str]":
+def on_container_checkpoint(path: str, parent_path: str = None) -> "tuple[bool, str]":
     orch, passed = read_state()
     if not passed:
         return False, "Could not read orchestrator state"
 
-    checkpoint = Checkpoint(orch.state.workload_state, path, client=client)
+    checkpoint = Checkpoint(
+        orch.state.workload_state,
+        path,
+        client=client,
+        parent_path=parent_path,
+    )
     orch.strategy.pool.append(checkpoint)
     print("Pool: ", orch.strategy.pool)
 
