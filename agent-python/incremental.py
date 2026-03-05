@@ -27,9 +27,9 @@ from minio import Minio
 # Dump Flow (build_dump_cmd() -> run cmd -> upload_entry()) in orchestrator.py:
 
 # First dump: full dump (entries is empty); create a new IncrementalChain
-# Second dump: incremental (len(entries) = 1 < max_depth=5)
+# Second dump: incremental (len(entries) = 1 < max_chain_length=5)
 # ...
-# Sixth dump: full dump (len(entries) = 5 >= max_depth=5); must create a new IncrementalChain
+# Sixth dump: full dump (len(entries) = 5 >= max_chain_length=5); must create a new IncrementalChain
 
 # ------------------------------------
 
@@ -50,12 +50,12 @@ from minio import Minio
 class IncrementalChain:
     """Manages a SINGLE local chain of CRIU checkpoint directories"""
 
-    def __init__(self, base_dir="./chain", max_depth=5):
+    def __init__(self, base_dir="./chain", max_chain_length=5):
         self.base_dir = base_dir
         self.entries = []
         self.restore_dir = None
         self.restored_depth = 0
-        self.max_depth = max_depth
+        self.max_chain_length = max_chain_length
 
     def setup_for_restore(self, client: Minio, checkpoint: Checkpoint, pool: List[Checkpoint]):
         """Download full ancestor chain from MinIO for this checkpoint
@@ -190,4 +190,4 @@ class IncrementalChain:
     def is_full_dump(self) -> bool:
         """Whether the next dump will be full (no parent) or incremental"""
 
-        return len(self.entries) >= self.max_depth or len(self.entries) == 0
+        return len(self.entries) >= self.max_chain_length or len(self.entries) == 0

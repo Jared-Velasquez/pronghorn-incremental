@@ -3,6 +3,28 @@
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 echo $DIR
 
+# Fail fast on missing prerequisites before doing any work.
+required_cmds=(multipass k3sup arkade kubectl faas-cli mc)
+missing_cmds=()
+for cmd in "${required_cmds[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        missing_cmds+=("$cmd")
+    fi
+done
+
+if [ ${#missing_cmds[@]} -gt 0 ]; then
+    echo "[Error] Missing dependencies: ${missing_cmds[*]}"
+    echo "Install prerequisites first, then re-run deploy.sh."
+    echo "See README.md -> Prerequisite section."
+    exit 1
+fi
+
+if [ ! -f ~/.ssh/id_rsa.pub ]; then
+    echo "[Error] Missing SSH public key: ~/.ssh/id_rsa.pub"
+    echo "Run: ssh-keygen -t rsa -b 4096 -N \"\" -f ~/.ssh/id_rsa"
+    exit 1
+fi
+
 # Configuring yaml files
 if [ -f multipass.yaml ]; then
     rm multipass.yaml
@@ -81,20 +103,32 @@ do
   if [ $node -eq 1 ];
   then
     echo "Deploying the master node"
-    multipass launch --cpus $cpus --memory $memory --disk $disk_size --name pronghorn 20.04 --cloud-init multipass.yaml
+    if ! multipass launch --cpus $cpus --memory $memory --disk $disk_size --name pronghorn 20.04 --cloud-init multipass.yaml; then
+        echo "[Error] Failed to launch master node with multipass."
+        exit 1
+    fi
     echo "Master node deployed"
   else
     echo Launching the worker nodes
-    multipass launch --cpus $cpus --memory $memory --disk $disk_size --name "pronghorn-m0$node" 20.04 --cloud-init multipass.yaml   
+    if ! multipass launch --cpus $cpus --memory $memory --disk $disk_size --name "pronghorn-m0$node" 20.04 --cloud-init multipass.yaml; then
+        echo "[Error] Failed to launch worker node pronghorn-m0$node with multipass."
+        exit 1
+    fi
     echo "Worker node $node deployed"
   fi
 done
 
 # Deploy Kubernetes Cluster
-k3sup install --ip $(multipass info pronghorn | grep IPv4 | awk '{print $2}') --user ubuntu --k3s-extra-args '--cluster-init'
+if ! k3sup install --ip $(multipass info pronghorn | grep IPv4 | awk '{print $2}') --user ubuntu --k3s-extra-args '--cluster-init'; then
+    echo "[Error] Failed to bootstrap k3s on master node."
+    exit 1
+fi
 for node in $(seq 2 $nodes)
 do
-    k3sup join --ip $(multipass info pronghorn-m0$node | grep IPv4 | awk '{print $2}') --server-ip $(multipass info pronghorn | grep IPv4 | awk '{print $2}') --user ubuntu
+    if ! k3sup join --ip $(multipass info pronghorn-m0$node | grep IPv4 | awk '{print $2}') --server-ip $(multipass info pronghorn | grep IPv4 | awk '{print $2}') --user ubuntu; then
+        echo "[Error] Failed to join worker node pronghorn-m0$node to the cluster."
+        exit 1
+    fi
 done
 
 echo "[Completed] Kuberentes cluster created with $nodes nodes, $cpus CPUs, $memory MB memory and $disk_size disk size."
