@@ -88,26 +88,36 @@ class IncrementalChain:
             current = path_index.get(current.parent_path) if current.parent_path else None
         chain.reverse()  # now ordered root -> ... -> leaf
 
-        # Download each entry and create parent symlinks
+        # Download each entry and create parent symlinks.
+        # For ancestor entries (not the leaf), only pages-*.img and pagemap-*.img
+        # are needed by CRIU to walk the page chain; all other metadata is read
+        # from the leaf only.
         prev_local_dir = None
+        leaf_path = chain[-1].path
         for entry in chain:
             local_dir = os.path.join(self.base_dir, entry.path)
             os.makedirs(local_dir, exist_ok=True)
 
+            is_leaf = entry.path == leaf_path
             objects = client.list_objects("checkpoints", prefix=entry.path, recursive=True)
             for obj in objects:
                 filename = obj.object_name.split("/", maxsplit=1)[1]
+                if not is_leaf and not (filename.startswith("pages-") or filename.startswith("pagemap-")):
+                    continue
                 client.fget_object("checkpoints", obj.object_name, os.path.join(local_dir, filename))
 
             if prev_local_dir is not None:
                 rel = os.path.relpath(prev_local_dir, local_dir)
                 os.symlink(rel, os.path.join(local_dir, "parent"))
 
-            self.entries.append(local_dir)
             prev_local_dir = local_dir
 
         self.restore_dir = prev_local_dir
         self.restored_depth = len(chain) - 1  # root is depth 0
+        # Keep only the leaf in entries so is_full_dump() doesn't trigger based on
+        # restored chain depth. The symlink chain is already set up locally, so
+        # entries[-1] is sufficient as prev_dir for the next incremental dump.
+        self.entries = [prev_local_dir]
         return self.restore_dir
 
     def clear_soft_dirty(self, pid):
@@ -124,12 +134,9 @@ class IncrementalChain:
     def upload_entry(self, client: Minio, entry_dir: str, minio_path: str):
         """Upload a single chain's entry files to MinIO"""
 
-        # CRIU creates a collection of multiple image files to save the state;
-        # assume we store in entry_dir
-
         if not os.path.isdir(entry_dir):
             raise ValueError(f"Invalid entry_dir {entry_dir}")
-        
+
         for root, dirs, files in os.walk(entry_dir):
             for file in files:
                 local_path = os.path.join(root, file)
@@ -194,6 +201,15 @@ class IncrementalChain:
         return f"criu restore --restore-detached --tcp-close -d -v3 -D {self.restore_dir}"
 
     def is_full_dump(self) -> bool:
-        """Whether the next dump will be full (no parent) or incremental"""
+        """Whether the next dump will be full (no parent) or incremental.
 
-        return len(self.entries) >= self.max_chain_length or len(self.entries) == 0
+        Uses restored_depth + new deltas added this container run to measure
+        total chain depth, so that max_chain_length is enforced globally rather
+        than resetting on every restore.
+        """
+        if len(self.entries) == 0:
+            return True  # cold start
+        # entries[0] is the restored leaf (or the full dump just taken).
+        # len(entries) - 1 counts new deltas added in this container run.
+        total_depth = self.restored_depth + (len(self.entries) - 1)
+        return total_depth >= self.max_chain_length
