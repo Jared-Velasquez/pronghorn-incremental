@@ -43,7 +43,7 @@ filename = "data/incremental-" + test + ".csv"
 
 STRATEGIES = [
     # "cold",
-    "request_centric&max_capacity=12",
+    # "request_centric&max_capacity=20",
     # "request_centric&max_capacity=12&incremental=true&max_chain_depth=3",
     "request_centric&max_capacity=12&incremental=true&max_chain_depth=5",
 ]

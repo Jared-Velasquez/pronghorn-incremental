@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 from pathlib import Path
 import subprocess
 import time
@@ -107,6 +108,9 @@ def after_request(latency):
                 chain.upload_entry(client, output_dir, path)
                 if prev_dir is None:
                     # Full dump starts a fresh chain root.
+                    # Clean up old chain directories that are no longer needed.
+                    for old_dir in chain.entries:
+                        shutil.rmtree(old_dir, ignore_errors=True)
                     chain.entries = [output_dir]
                 else:
                     chain.entries.append(output_dir)

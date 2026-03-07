@@ -367,6 +367,10 @@ def on_container_checkpoint(path: str, parent_path: str = None) -> "tuple[bool, 
     orch.strategy.pool.append(checkpoint)
     print("Pool: ", orch.strategy.pool)
 
+    if len(orch.strategy.pool) > orch.strategy.max_capacity:
+        orch.strategy._prune_pool()
+        print("Pool after pruning: ", orch.strategy.pool)
+
     if save_state(orch):
         return (True, "Registered checkpoint!")
     else:
