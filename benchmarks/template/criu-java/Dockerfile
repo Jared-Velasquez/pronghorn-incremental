@@ -5,7 +5,7 @@ FROM firebolt55439/criu:latest as criu
 FROM pfelipefeitosa/of-watchdog:criu-light as watchdog
 
 # FROM openjdk:8u212-jdk-alpine as builder
-FROM openjdk:17-alpine as builder
+FROM eclipse-temurin:17-jdk-alpine as builder
 
 RUN apk --no-cache add curl \
     && addgroup -S app && adduser -S -g app app \
@@ -32,7 +32,7 @@ COPY . /home/app/
 RUN gradle build
 
 # FROM openjdk:8u212-jdk-alpine as ship
-FROM openjdk:17-alpine as ship
+FROM eclipse-temurin:17-jre-alpine as ship
 
 COPY --from=criu /usr/local/sbin/criu /usr/local/sbin/criu
 COPY --from=criu /usr/lib/libprotobuf-c.so.1 /usr/lib/libprotobuf-c.so.1

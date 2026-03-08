@@ -12,12 +12,16 @@ class Checkpoint(object):
         path: str,
         bucket: str = "checkpoints",
         client: Minio = None,
+        parent_path: str = None,
     ) -> None:
         super().__init__()
         self.bucket = bucket
         self.path = path  # MinIO path prefix
         self.state = deepcopy(state)
         self.client = client
+
+        # Either MinIO path of parent checkpoint or None for a full dump
+        self.parent_path = parent_path
 
     def __str__(self):
         return f"Checkpoint @ {self.state.request_number}"
@@ -39,12 +43,10 @@ class Checkpoint(object):
         return {
             "bucket": self.bucket,
             "path": self.path,
+            "parent_path": self.parent_path,
             "state": self.state.serialize(),
         }
 
     def deserialize(payload: str, client: Minio):
-        # print("Payload:", payload)
-        
-        # obj = json.loads(payload)
         obj = payload
-        return Checkpoint(WorkloadState.deserialize(obj["state"]), obj["path"], obj["bucket"], client)
+        return Checkpoint(WorkloadState.deserialize(obj["state"]), obj["path"], obj["bucket"], client, obj["parent_path"])

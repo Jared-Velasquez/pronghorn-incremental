@@ -167,12 +167,21 @@ class RequestCentricStrategy(CRStrategy):
             leaves = [chkpt for chkpt in self.pool if chkpt.path not in parent_paths]
             if not leaves:
                 leaves = list(self.pool)
+            # Filter out checkpoints with no viable checkpoint window: if
+            # request_number + 1 >= max_requests, when_to_checkpoint returns the
+            # sentinel 50000 (empty weights slice) and the container immediately
+            # evicts after one request with no new checkpoint, causing a stuck loop.
+            viable_leaves = [c for c in leaves if c.state.request_number + 1 < self.workload.max_requests]
+            if viable_leaves:
+                leaves = viable_leaves
             expanded_pool = leaves + [None]
             weights = [self._weights_for(chkpt.state.request_number, scalar=True) if chkpt is not None else 0 for chkpt in expanded_pool]
         # Default Non Incremental Case
         else:
-            expanded_pool = self.pool + [None]
-            weights = [ self._weights_for(chkpt.state.request_number if chkpt is not None else 0, scalar=True) for chkpt in expanded_pool ]
+            viable = [c for c in self.pool if c.state.request_number + 1 < self.workload.max_requests]
+            candidates = viable if viable else self.pool
+            expanded_pool = candidates + [None]
+            weights = [self._weights_for(chkpt.state.request_number if chkpt is not None else 0, scalar=True) for chkpt in expanded_pool]
 
         weights = np.array(weights)
         weights_max = np.amax(weights, keepdims=True)

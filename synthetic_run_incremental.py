@@ -15,6 +15,10 @@ import subprocess
 import requests
 import re
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from tqdm import tqdm
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
@@ -43,7 +47,7 @@ filename = "data/incremental-" + test + ".csv"
 
 STRATEGIES = [
     # "cold",
-    # "request_centric&max_capacity=20",
+    # "request_centric&max_capacity=12",
     # "request_centric&max_capacity=12&incremental=true&max_chain_depth=3",
     "request_centric&max_capacity=12&incremental=true&max_chain_depth=5",
 ]
@@ -125,6 +129,51 @@ def measure_storage_bytes():
         return 0
 
 
+POOL_CAPACITY = 12  # C — used for avg_snapshot_size estimate in network formula
+
+plots_directory = "plots"
+if not os.path.exists(plots_directory):
+    os.makedirs(plots_directory)
+
+
+def plot_run(rows, benchmark, strategy, rate, uid):
+    """Generate storage-over-time and cumulative network bandwidth plots for one run."""
+    request_nums   = [r[0] for r in rows]
+    storage_mb     = [r[7] / (1024 ** 2) for r in rows]
+
+    # Cumulative network bandwidth (paper formula):
+    #   2 × num_lifetimes × avg_snapshot_size
+    # where num_lifetimes = request_num / rate
+    #       avg_snapshot_size = current pool size / C
+    network_mb = [
+        2 * (req / rate) * (sb / POOL_CAPACITY)
+        for req, sb in zip(request_nums, storage_mb)
+    ]
+
+    strategy_label = strategy.replace("&", "\n  ")
+    safe_strategy  = re.sub(r"[^a-zA-Z0-9_-]", "_", strategy)
+    plot_path = os.path.join(
+        plots_directory, f"{benchmark}_{safe_strategy}_rate{rate}_{uid}.png"
+    )
+
+    fig, (ax_storage, ax_network) = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
+
+    ax_storage.plot(request_nums, storage_mb, linewidth=1.5, color="steelblue")
+    ax_storage.set_ylabel("Storage used (MB)")
+    ax_storage.set_title(f"{benchmark}  |  rate={rate}  |  {strategy_label}", fontsize=9)
+    ax_storage.grid(True, alpha=0.3)
+
+    ax_network.plot(request_nums, network_mb, linewidth=1.5, color="darkorange")
+    ax_network.set_ylabel("Cumulative network (MB)")
+    ax_network.set_xlabel("Request number")
+    ax_network.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    logger.info("Saved plot: %s", plot_path)
+
+
 user = "jaredvel25"
 
 with open(filename, "a") as output_file:
@@ -155,10 +204,18 @@ with open(filename, "a") as output_file:
                     rate,
                 )
 
+                STORAGE_SAMPLE_INTERVAL = 10  # measure MinIO storage every N requests
+
                 rows = []
                 nums = re.compile(r"\d+ ms")
                 url = f"http://127.0.0.1:8080/function/{benchmark}?mutability=1"
+                current_storage_bytes = 0
                 for index, _ in tqdm(enumerate(range(NUM_REQUESTS))):
+                    if index % STORAGE_SAMPLE_INTERVAL == 0:
+                        current_storage_bytes = measure_storage_bytes()
+                        logger.debug(
+                            "Storage sample at request %s: %s bytes", index + 1, current_storage_bytes
+                        )
                     retries = 0
                     for retry in range(3):
                         try:
@@ -180,7 +237,7 @@ with open(filename, "a") as output_file:
                             )
                             logger.debug("%s %s %s", server_side, overhead, client_side)
                             rows.append(
-                                (index + 1, benchmark, strategy, rate, client_side, server_side, overhead)
+                                (index + 1, benchmark, strategy, rate, client_side, server_side, overhead, current_storage_bytes)
                             )
                             time.sleep(REQUEST_DELAY / 1000)
                         except Exception as e:
@@ -192,21 +249,13 @@ with open(filename, "a") as output_file:
                         else:
                             break
 
-                # Measure storage before cleanup so the metric reflects the full run
-                storage_bytes = measure_storage_bytes()
-                logger.info(
-                    "Storage after run — strategy: %s, benchmark: %s, rate: %s, bytes: %s",
-                    strategy,
-                    benchmark,
-                    rate,
-                    storage_bytes,
-                )
-
-                for index, benchmark_name, strat, r, client_side, server_side, overhead in rows:
+                for index, benchmark_name, strat, r, client_side, server_side, overhead, storage_bytes in rows:
                     output_file.write(
                         f"{index},{benchmark_name},1,{strat},{r},{client_side},{server_side},{overhead},{storage_bytes}\n"
                     )
                 output_file.flush()
+
+                plot_run(rows, benchmark, strategy, rate, uid)
 
                 logger.info(
                     "Completed strategy: %s for benchmark %s with rate %s",

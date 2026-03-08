@@ -4,7 +4,7 @@ provider:
   gateway: http://127.0.0.1:8080
 functions:
   simple-hash:
-    lang: criu-java-8
+    lang: criu-java
     handler: ./java/simple-hash
     image: jaredvel25/simple-hash:latest
 

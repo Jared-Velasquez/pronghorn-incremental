@@ -4,6 +4,6 @@ provider:
   gateway: http://127.0.0.1:8080
 functions:
   html-rendering:
-    lang: criu-java-8
+    lang: criu-java
     handler: ./java/html-rendering
     image: jaredvel25/html-rendering:latest
