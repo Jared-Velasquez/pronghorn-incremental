@@ -1,6 +1,7 @@
 from typing import List
 import os
 import shutil
+import struct
 from pathlib import Path
 
 from orchestration.checkpoint import Checkpoint
@@ -50,12 +51,27 @@ from minio import Minio
 class IncrementalChain:
     """Manages a SINGLE local chain of CRIU checkpoint directories"""
 
+    # Opt 1: if a delta's pages exceed this fraction of the last full dump size, force a
+    # fresh full dump next cycle instead of continuing the chain.
+    SIZE_RATIO_THRESHOLD = 0.80
+
+    # Opt 4: if more than this fraction of pages are dirty after the first post-restore
+    # request, the workload is too write-heavy for incremental to help; force full dumps.
+    DIRTY_RATE_THRESHOLD = 0.70
+
     def __init__(self, base_dir="./chain", max_chain_length=5):
         self.base_dir = base_dir
         self.entries = []
         self.restore_dir = None
         self.restored_depth = 0
         self.max_chain_length = max_chain_length
+
+        # Opt 1: size-threshold guard state
+        self.last_full_dump_size: int = 0
+        self._force_full_next: bool = False
+
+        # Opt 4: post-restore dirty-rate sampling state
+        self.pending_dirty_check: bool = False
 
         if os.path.exists(base_dir):
             shutil.rmtree(base_dir)
@@ -121,12 +137,19 @@ class IncrementalChain:
 
     def clear_soft_dirty(self, pid):
         """Reset all soft-dirty bits so the next dump tracks only new changes
-        from the immediately previous dump"""
+        from the immediately previous dump.
+
+        Also arms the post-restore dirty-rate check (Opt 4): after the next
+        request completes, check_dirty_rate() should be called to measure how
+        much memory the workload dirtied, and decide whether incremental dumps
+        are worth continuing.
+        """
 
         clear_refs_path = Path(f"/proc/{pid}/clear_refs")
         try:
             with open(clear_refs_path, 'w') as f:
                 f.write('4')
+            self.pending_dirty_check = True  # Opt 4: arm the check
         except Exception as e:
             print(f"Error clearing soft-dirty bits for pid {pid}: {e}")
 
@@ -199,13 +222,102 @@ class IncrementalChain:
         """Construct CRIU restore command. CRIU follows parent symlinks automatically."""
         return f"criu restore --restore-detached --tcp-close -d -v3 -D {self.restore_dir}"
 
+    def record_dump(self, entry_dir: str, was_full: bool):
+        """Update size-threshold state after a successful dump (Opt 1).
+
+        If the dump was a full dump, record its page size as the baseline for
+        subsequent delta comparisons.  If it was an incremental dump and its
+        page size is >= SIZE_RATIO_THRESHOLD of the last full dump, flag the
+        next dump to be forced full (the delta is too large to be worthwhile).
+        """
+        size = self.get_entry_size(entry_dir)
+        if was_full:
+            self.last_full_dump_size = size
+            self._force_full_next = False
+            print(f"IncrementalChain: full dump size recorded as {size} bytes")
+        elif self.last_full_dump_size > 0:
+            ratio = size / self.last_full_dump_size
+            print(f"IncrementalChain: delta size {size} bytes ({ratio:.1%} of full dump)")
+            if ratio >= self.SIZE_RATIO_THRESHOLD:
+                self._force_full_next = True
+                print(
+                    f"IncrementalChain: delta too large ({ratio:.1%} >= {self.SIZE_RATIO_THRESHOLD:.0%}), "
+                    "forcing full dump next cycle"
+                )
+
+    def count_soft_dirty_ratio(self, pid: str) -> float:
+        """Estimate the fraction of mapped pages that are soft-dirty (Opt 4).
+
+        Reads /proc/{pid}/maps for the virtual address layout, then reads
+        /proc/{pid}/pagemap (bit 55 = soft-dirty) for each region.
+        Returns a value in [0.0, 1.0]; returns 1.0 on any error so the caller
+        defaults to the conservative (force-full-dump) path.
+        """
+        PAGE_SIZE = 4096
+        total_pages = 0
+        dirty_pages = 0
+        try:
+            maps_path = f"/proc/{pid}/maps"
+            pagemap_path = f"/proc/{pid}/pagemap"
+            with open(maps_path, 'r') as maps_file, open(pagemap_path, 'rb') as pagemap_file:
+                for line in maps_file:
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    addrs = parts[0].split('-')
+                    start = int(addrs[0], 16)
+                    end = int(addrs[1], 16)
+                    num_pages = (end - start) // PAGE_SIZE
+                    if num_pages <= 0:
+                        continue
+                    pagemap_file.seek((start // PAGE_SIZE) * 8)
+                    data = pagemap_file.read(num_pages * 8)
+                    count = len(data) // 8
+                    if count == 0:
+                        continue
+                    entries = struct.unpack(f'{count}Q', data[:count * 8])
+                    for entry in entries:
+                        if entry & (1 << 55):  # soft-dirty bit
+                            dirty_pages += 1
+                    total_pages += count
+        except Exception as e:
+            print(f"count_soft_dirty_ratio error for pid {pid}: {e}")
+            return 1.0
+        if total_pages == 0:
+            return 0.0
+        return dirty_pages / total_pages
+
+    def check_dirty_rate(self, pid: str):
+        """If a dirty-rate check is pending, measure and act on it (Opt 4).
+
+        Should be called once after the first request following a restore +
+        clear_soft_dirty().  If the dirty ratio exceeds DIRTY_RATE_THRESHOLD,
+        force the next dump to be full (the workload writes too much memory for
+        incremental deltas to produce meaningful savings).
+        """
+        if not self.pending_dirty_check:
+            return
+        self.pending_dirty_check = False
+        ratio = self.count_soft_dirty_ratio(pid)
+        print(f"IncrementalChain: post-restore dirty ratio = {ratio:.1%}")
+        if ratio >= self.DIRTY_RATE_THRESHOLD:
+            self._force_full_next = True
+            print(
+                f"IncrementalChain: dirty ratio {ratio:.1%} >= {self.DIRTY_RATE_THRESHOLD:.0%}, "
+                "forcing full dump next cycle"
+            )
+
     def is_full_dump(self) -> bool:
         """Whether the next dump will be full (no parent) or incremental.
 
-        Uses restored_depth + new deltas added this container run to measure
-        total chain depth, so that max_chain_length is enforced globally rather
-        than resetting on every restore.
+        Returns True if:
+        - cold start (no entries yet)
+        - max chain depth reached
+        - size-threshold guard fired (Opt 1): last delta was >= SIZE_RATIO_THRESHOLD of full
+        - dirty-rate check fired (Opt 4): post-restore dirty ratio too high
         """
+        if self._force_full_next:
+            return True
         if len(self.entries) == 0:
             return True  # cold start
         # entries[0] is the restored leaf (or the full dump just taken).

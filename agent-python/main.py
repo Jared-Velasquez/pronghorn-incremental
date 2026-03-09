@@ -84,6 +84,16 @@ def get_java_pid():
 def after_request(latency):
     global chain, last_checkpoint_path, needs_reinit
 
+    # Opt 4: if a post-restore dirty-rate check is pending, run it now (after
+    # the first request has executed) before any checkpoint decision is made.
+    if chain is not None and chain.pending_dirty_check:
+        try:
+            pid = get_pypy_pid()
+            chain.check_dirty_rate(pid)
+        except Exception as e:
+            print(f"Dirty-rate check failed, skipping: {e}")
+            chain.pending_dirty_check = False
+
     passed, state = on_container_request(
         float(latency)
     )  # execute_callback(CallbackRoutes.REQUEST, params={"latency": latency})
@@ -106,6 +116,9 @@ def after_request(latency):
             else:
                 print("Checkpointing succeeded! Uploading to MinIO...")
                 chain.upload_entry(client, output_dir, path)
+                # Opt 1: record dump size so the next cycle can detect
+                # oversized deltas and fall back to a full dump.
+                chain.record_dump(output_dir, was_full=(prev_dir is None))
                 if prev_dir is None:
                     # Full dump starts a fresh chain root.
                     # Clean up old chain directories that are no longer needed.

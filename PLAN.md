@@ -15,22 +15,28 @@ Pronghorn maintains a pool of CRIU checkpoints at various invocation counts. Cur
 **Depends on:** Nothing — this is the foundational data structure.
 
 ### 1a. Add `max_depth` parameter and enforce it
+
 - Add `max_depth` param to `__init__` (default 5)
 - Update `is_full_dump()` to return `True` when `self.restored_depth >= self.max_depth` OR `len(self.entries) == 0`
 - Set `self.restored_depth` at the end of `setup_for_restore()` to `len(chain) - 1` (depth of the leaf checkpoint)
 
 ### 1b. Fix `upload_entry` — upload ALL files, not just `pages-*.img`
+
 - Remove the `pages-*.img` filter. A CRIU dump directory contains `core-*.img`, `mm-*.img`, `fdinfo-*.img`, `pstree.img`, etc. — all are required for restore.
 - Keep `get_entry_size` filtered to `pages-*.img` (that's a metrics method, measuring delta size is correct).
 
 ### 1c. Fix `get_chain_depth` — handle broken chains
+
 - Change `path_index[current.parent_path]` to `path_index.get(current.parent_path)` with a `None` check, matching the pattern in `setup_for_restore`.
 
 ### 1d. Fix symlink creation for nested paths
+
 - In `setup_for_restore`, compute the relative path between `local_dir` and `prev_local_dir` using `os.path.relpath` instead of assuming flat sibling directories.
 
 ### 1e. Add `build_dump_cmd` method
+
 Constructs the CRIU dump command. Logic:
+
 ```python
 def build_dump_cmd(self, pid: int, output_dir: str, prev_dir: str = None) -> str:
     cmd = f"criu dump -t {pid} -v3 --tcp-established --leave-running -D {output_dir}"
@@ -40,14 +46,17 @@ def build_dump_cmd(self, pid: int, output_dir: str, prev_dir: str = None) -> str
         cmd += f" --prev-images-dir {rel} --track-mem"
     return cmd
 ```
+
 - When `is_full_dump()` is True → `prev_dir=None` (full dump, same as today)
 - When incremental → `prev_dir` points to the parent's local checkpoint directory
 
 ### 1f. Add `build_restore_cmd` method
+
 ```python
 def build_restore_cmd(self) -> str:
     return f"criu restore --restore-detached --tcp-close -d -v3 -D {self.restore_dir}"
 ```
+
 CRIU automatically follows `parent` symlinks during restore — no extra flags needed.
 
 ---
@@ -61,9 +70,11 @@ CRIU automatically follows `parent` symlinks during restore — no extra flags n
 **Depends on:** Nothing (configuration plumbing, independent of Step 1).
 
 ### 2a. Parse `incremental` and `max_chain_depth` from the ENV strategy string
+
 In `cr_deserialize` (`utils.py:9-19`), the empty-payload branch does literal string comparisons and falls through to a bare `RequestCentricStrategy(Parameters(), [])`. It discards all `&`-separated parameters.
 
 Fix: parse the strategy string into key-value pairs:
+
 ```python
 strategy_env = os.getenv("ENV").split(",")[0]
 params = {}
@@ -76,9 +87,11 @@ if "&" in strategy_env:
 else:
     strategy_name = strategy_env
 ```
+
 Then pass `incremental=params.get("incremental", "false") == "true"` and `max_chain_depth=int(params.get("max_chain_depth", "5"))` to the strategy constructor, along with `max_capacity`.
 
 ### 2b. Add `incremental` and `max_chain_depth` fields to `RequestCentricStrategy`
+
 - Add `incremental: bool = False` and `max_chain_depth: int = 5` parameters to `__init__`
 - Store as instance variables
 - Include in `extra_state` property so they survive serialization:
@@ -94,6 +107,7 @@ Then pass `incremental=params.get("incremental", "false") == "true"` and `max_ch
 - Update the deserialized branch in `cr_deserialize` (line 29-38) to read these fields from the JSON payload and pass them to the constructor
 
 ### 2c. Propagate incremental config to the agent
+
 The orchestrator's `on_container_started()` return dict must include `incremental` and `max_chain_depth` so that `main.py` knows whether to use `IncrementalChain`. This replaces the separate `MAX_CHAIN_DEPTH` env var approach (resolves flaw H1 — single source of truth through the strategy object).
 
 ---
@@ -107,15 +121,18 @@ The orchestrator's `on_container_started()` return dict must include `incrementa
 **Depends on:** Step 1 (the orchestrator must serialize `Checkpoint` objects whose `parent_path` field is consumed by the fixed `IncrementalChain`) and Step 2 (the strategy object now carries `incremental` and `max_chain_depth` fields that must be included in the return dict).
 
 ### 3a. `on_container_started()` — return chain info and incremental config
+
 Currently returns: `{ from_checkpoint, checkpoint_location, will_checkpoint_at }`
 
 Add to the return dict:
+
 - `checkpoint_object`: the serialized `Checkpoint` (including `parent_path`) — use `checkpoint.serialize()`
 - `pool`: the serialized pool list — use `[chkpt.serialize() for chkpt in pool]`
 - `incremental`: from `orch.strategy.incremental`
 - `max_chain_depth`: from `orch.strategy.max_chain_depth`
 
 ### 3b. `on_container_checkpoint(path, parent_path)` — accept parent_path
+
 - Add `parent_path` parameter (default `None` for backward compatibility)
 - Set `checkpoint.parent_path = parent_path` when creating the new `Checkpoint` object
 - This is the key field that links the chain together in the pool
@@ -131,15 +148,20 @@ Add to the return dict:
 **Depends on:** Step 1 (uses `IncrementalChain` methods), Step 2 (strategy carries `incremental`/`max_chain_depth`), and Step 3 (consumes `checkpoint_object`, `pool`, `incremental`, `max_chain_depth` from the orchestrator, passes `parent_path` back via `on_container_checkpoint`).
 
 ### 4a. Add module-level globals for chain state
+
 Declare at module level (alongside existing `client: Minio`):
+
 ```python
 chain: IncrementalChain = None
 last_checkpoint_path: str = None  # tracks parent_path for next dump
 ```
+
 This resolves flaws C4 and C5 — the chain instance and restored checkpoint path are shared between `init()` and `after_request()`.
 
 ### 4b. Restore path (in `init()`)
+
 If `state["incremental"]` is True and `state["from_checkpoint"]` is True:
+
 1. Instantiate `IncrementalChain(base_dir="./chain", max_depth=state["max_chain_depth"])`
 2. Deserialize `checkpoint_object` and `pool` from the orchestrator return dict (requires importing `Checkpoint` and calling `Checkpoint.deserialize(payload, client)`)
 3. Call `chain.setup_for_restore(client, checkpoint, pool)` — downloads the full ancestor chain and creates symlinks
@@ -148,6 +170,7 @@ If `state["incremental"]` is True and `state["from_checkpoint"]` is True:
 6. Set `last_checkpoint_path = state["checkpoint_location"]`
 
 If `state["incremental"]` is True but `state["from_checkpoint"]` is False (cold start):
+
 1. Instantiate `IncrementalChain(base_dir="./chain", max_depth=state["max_chain_depth"])` with empty entries
 2. Proceed with cold start as normal
 3. `last_checkpoint_path` stays `None`
@@ -155,7 +178,9 @@ If `state["incremental"]` is True but `state["from_checkpoint"]` is False (cold 
 If `state["incremental"]` is False, use existing full-dump logic unchanged.
 
 ### 4c. Dump path (in `after_request()`)
+
 If `chain` is not None (incremental mode):
+
 1. Clean and create output dir: `rm -rf ./chain/{checkpoint_location} && mkdir -p ./chain/{checkpoint_location}`
 2. Determine `prev_dir`: if `chain.is_full_dump()` → `None`, else → `chain.entries[-1]`
 3. Call `chain.build_dump_cmd(pid, output_dir, prev_dir)` and execute
@@ -179,25 +204,32 @@ If `chain` is None, use existing full-dump logic unchanged.
 **Depends on:** Steps 1–4 — pruning operates on `parent_path` fields that are set by the orchestrator (Step 3) and populated during the dump lifecycle (Step 4). The chain depth logic relies on `IncrementalChain.is_full_dump` (Step 1).
 
 ### 5a. Build chain dependency graph before pruning
+
 In `_prune_pool()`, before selecting which checkpoints to keep:
+
 1. Build a `children` map: `{checkpoint.path: [child checkpoints]}` by scanning `parent_path` fields
 2. Build a `roots` set: checkpoints where `parent_path is None` (full dumps)
 
 ### 5b. Protect chain integrity during pruning
+
 When deciding to delete a checkpoint:
+
 - If it has children that are being kept → do NOT delete it (would break their restore chain)
 - If deleting, also delete all its descendants (cascade)
 
 Simplest safe approach: prune at the **chain level**, not individual checkpoint level.
+
 - Group checkpoints by their root (walk each to its root)
 - Score each chain by the best-performing checkpoint it contains
 - Keep/discard entire chains
 - Within kept chains, individual checkpoints can still be pruned if they are leaves with no children
 
 ### 5c. Guard `reset()` for chain safety
+
 `reset()` (`request_centric.py:153-156`) calls `chkpt.delete()` on every checkpoint. This is safe (it deletes the entire pool), but document that it must always delete all checkpoints — never a subset — to avoid orphaning descendants.
 
 ### 5d. Enforce max chain depth at pruning time
+
 - If any chain exceeds `max_depth`, mark it for replacement: keep it for now but flag that the next dump from its leaf should be a full dump (this is already handled by `is_full_dump` in Step 1a)
 
 ---
@@ -211,18 +243,24 @@ Simplest safe approach: prune at the **chain level**, not individual checkpoint 
 **Depends on:** Steps 1–5 — the entire incremental delta system must be functional before it can be benchmarked end-to-end.
 
 ### 6a. Add incremental strategy variants
+
 Add to `STRATEGIES`:
+
 ```python
 "request_centric&max_capacity=12&incremental=true&max_chain_depth=5"
 ```
+
 Compare against the existing `request_centric&max_capacity=12` (full dumps) to measure delta.
 
 ### 6b. Add storage metrics
+
 After each benchmark run, before cleanup:
+
 - Query MinIO for total storage used by checkpoints bucket
 - Log to CSV: add `storage_bytes` column
 
 ### 6c. Add chain depth metrics
+
 - Log the chain depth of each restored checkpoint to CSV: add `chain_depth` column
 - This enables analysis of restore latency vs. chain depth
 
@@ -230,15 +268,15 @@ After each benchmark run, before cleanup:
 
 ## Files Modified (Summary)
 
-| File | Changes |
-|------|---------|
-| `agent-python/incremental.py` | Fix bugs, add max_depth, add build_dump_cmd/build_restore_cmd, fix upload_entry |
-| `agent-python/orchestration/utils.py` | Parse `incremental`/`max_chain_depth` from ENV strategy string |
-| `agent-python/orchestration/strategies/request_centric.py` | Add `incremental`/`max_chain_depth` fields, chain-aware pruning |
-| `agent-python/orchestrator.py` | Pass chain metadata (checkpoint object, pool, parent_path, incremental config) |
-| `agent-python/main.py` | Wire IncrementalChain into restore and dump paths, add chain/path globals |
-| `agent-python/orchestration/checkpoint.py` | No changes needed (parent_path already exists) |
-| `synthetic_run.py` | Add incremental strategy variants, storage/depth metrics |
+| File                                                       | Changes                                                                         |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `agent-python/incremental.py`                              | Fix bugs, add max_depth, add build_dump_cmd/build_restore_cmd, fix upload_entry |
+| `agent-python/orchestration/utils.py`                      | Parse `incremental`/`max_chain_depth` from ENV strategy string                  |
+| `agent-python/orchestration/strategies/request_centric.py` | Add `incremental`/`max_chain_depth` fields, chain-aware pruning                 |
+| `agent-python/orchestrator.py`                             | Pass chain metadata (checkpoint object, pool, parent_path, incremental config)  |
+| `agent-python/main.py`                                     | Wire IncrementalChain into restore and dump paths, add chain/path globals       |
+| `agent-python/orchestration/checkpoint.py`                 | No changes needed (parent_path already exists)                                  |
+| `synthetic_run.py`                                         | Add incremental strategy variants, storage/depth metrics                        |
 
 ---
 
@@ -260,19 +298,19 @@ After each benchmark run, before cleanup:
 
 Pronghorn's pruning (Section 3.4 of the paper, `_prune_pool` in `request_centric.py`) is already aggressive: it keeps only the top `p=40%` by performance plus `gamma=10%` random from the remainder each time the pool exceeds `C`. With `C=12`, the pool oscillates between ~6 and 13 checkpoints, averaging ~9.5 full dumps in storage.
 
-The paper explicitly acknowledges that cloud providers can reduce storage by lowering `C` (Section 5.3: *"setting C=2 instead of C=12"*). A provider could set `C=2` with full dumps and achieve storage far below any incremental system at `C=12`:
+The paper explicitly acknowledges that cloud providers can reduce storage by lowering `C` (Section 5.3: _"setting C=2 instead of C=12"_). A provider could set `C=2` with full dumps and achieve storage far below any incremental system at `C=12`:
 
-| Config | Storage (Python, ~55MB/snapshot) | Restore points |
-|--------|----------------------------------|----------------|
-| Full dumps, `C=12` | ~660MB | 12 |
-| Incremental, `C=12`, depth 5 | ~215MB (3 full + 9 deltas) | 12 |
-| Full dumps, `C=2` | ~110MB | 2 |
+| Config                       | Storage (Python, ~55MB/snapshot) | Restore points |
+| ---------------------------- | -------------------------------- | -------------- |
+| Full dumps, `C=12`           | ~660MB                           | 12             |
+| Incremental, `C=12`, depth 5 | ~215MB (3 full + 9 deltas)       | 12             |
+| Full dumps, `C=2`            | ~110MB                           | 2              |
 
 However, the paper's entire contribution demonstrates that a diverse checkpoint pool is essential for finding high-performance snapshots via exploration-exploitation. With `C=2`, the system retains only 2 restore points, collapsing the exploration-exploitation tradeoff and degrading latency — the very metric Pronghorn optimizes (37.2% median improvement at `C=12`).
 
 **The value proposition of incremental deltas is not to compete with capacity reduction, but to make it unnecessary.** Incremental deltas achieve `C=2`-level storage costs (~215MB vs ~660MB, a ~67% reduction) while preserving `C=12`-level checkpoint diversity and latency. The correct comparison is always at the same `C`: same number of restore points, same latency characteristics, but dramatically less storage per checkpoint.
 
-**Key evaluation implication:** Step 6's benchmarks must compare at the same `C` to be meaningful. If we also include a `C=2` full-dump baseline, we should report both storage *and* latency to show that our incremental system at `C=12` achieves comparable storage to `C=2` full dumps without the latency penalty.
+**Key evaluation implication:** Step 6's benchmarks must compare at the same `C` to be meaningful. If we also include a `C=2` full-dump baseline, we should report both storage _and_ latency to show that our incremental system at `C=12` achieves comparable storage to `C=2` full dumps without the latency penalty.
 
 ### Chain-level pruning degrades pool diversity
 
@@ -293,19 +331,27 @@ Pronghorn's pruning algorithm scores each checkpoint individually, keeps the top
 #### Leaf-only pruning: advantages and disadvantages
 
 **Advantages:**
+
 - Recovers per-checkpoint granularity on the pool frontier — any leaf can be individually scored and pruned, preserving Pronghorn's exploration-exploitation dynamics far better than chain-level pruning.
 - Chain integrity is guaranteed by construction: you never delete a node that has children, so no descendant is ever orphaned. No need for cascade-delete logic or chain-grouping (Step 5a/5b simplifies significantly).
 - Simple to implement — a single `has_children(checkpoint, pool)` check before allowing deletion.
 - Graceful degradation: even if some slots are pinned, the remaining prunable leaves still provide meaningful diversity compared to the 2–3 pruning units of chain-level pruning.
 
 **Disadvantages:**
+
 - Roots and intermediate nodes are "pinned" — they occupy pool slots but cannot be removed while they have descendants. This is dead weight: unprunable checkpoints that may have poor performance scores but still consume capacity.
 - Slow reclamation: freeing a depth-5 chain takes up to 5 pruning rounds (peel one leaf per round). If the pool is full of deep chains with pinned intermediates, it may take many rounds before enough capacity is freed for new exploration.
-- A poorly-performing root that spawned many branches cannot be removed until *all* its descendants are pruned first — even if the root is the worst checkpoint in the pool. The pruning algorithm must work around it.
+- A poorly-performing root that spawned many branches cannot be removed until _all_ its descendants are pruned first — even if the root is the worst checkpoint in the pool. The pruning algorithm must work around it.
 - Can lead to pool stagnation: if most checkpoints are pinned intermediates, the effective number of prunable candidates shrinks, reducing the pruning algorithm's ability to make room for new checkpoints. In the worst case (all chains at max depth, heavy branching), nearly all pool slots could be pinned.
 - Storage reclamation is gradual rather than immediate — if a burst of new checkpoints demands space, leaf-only pruning may not free slots fast enough, potentially requiring a fallback to chain-level or cascade pruning.
 
 **Recommendation:** Leaf-only pruning is the strongest starting point — it's simple, safe, and preserves the most diversity. Shorter `max_chain_depth` (2–3) further mitigates the pinning and slow-reclamation downsides by limiting how much dead weight any single chain can create. The combination of leaf-only pruning + low max depth likely captures most of the storage savings while preserving most of the pool diversity. Step 6 benchmarks should compare chain-level vs. leaf-only pruning at various depths to quantify the tradeoff empirically.
+
+### PyPy Generational Garbage Collection
+
+PyPy uses a generational, copying garbage collector. On each GC cycle it physically moves objects between heap regions — zeroing source pages and writing to destination pages. This dirties memory that the application never logically changed. A single GC cycle can dirty 30–50%+ of the heap, independent of what BFS actually computed. CPython (used by the HTTP server test) uses reference counting + a non-moving collector, so it doesn't have this effect
+
+For BFS, each BFS traversal walks the entire graph adjacency structure, reading and writing visited-node state across a large memory footprint. With 4KB soft-dirty granularity, even reading adjacent memory addresses on the same page marks the whole page dirty. The result: a large fraction of the heap is dirty after every request, so the delta size approaches the full dump size.
 
 ---
 
@@ -319,7 +365,7 @@ The following issues were identified by reviewing the plan against the actual co
 
 **C2. `--track-mem` must be on full dumps too, not just incremental dumps**
 
-Step 1e's `build_dump_cmd` only adds `--track-mem` when `prev_dir is not None` (incremental). But `--track-mem` enables kernel memory change tracking *going forward* from that dump. If the initial full dump after a cold start (where `clear_soft_dirty` was never called) omits `--track-mem`, the subsequent incremental dump has no soft-dirty information — CRIU will either error or produce a dump identical in size to a full dump. Fix: always include `--track-mem` when incremental mode is enabled, regardless of whether the current dump is full or incremental.
+Step 1e's `build_dump_cmd` only adds `--track-mem` when `prev_dir is not None` (incremental). But `--track-mem` enables kernel memory change tracking _going forward_ from that dump. If the initial full dump after a cold start (where `clear_soft_dirty` was never called) omits `--track-mem`, the subsequent incremental dump has no soft-dirty information — CRIU will either error or produce a dump identical in size to a full dump. Fix: always include `--track-mem` when incremental mode is enabled, regardless of whether the current dump is full or incremental.
 
 **C3. `is_full_dump()` uses frozen `restored_depth` — max depth never enforced within a lifecycle**
 
@@ -351,30 +397,75 @@ When incremental mode is first enabled, existing checkpoints all have `parent_pa
 
 ### Summary Table
 
-| # | Status | Severity | Issue | Fix location |
-|---|--------|----------|-------|-------------|
-| C1 | RESOLVED | Critical | `cr_deserialize` doesn't parse `incremental`/`max_chain_depth` | Step 2 |
-| C2 | OPEN | Critical | `--track-mem` missing on full dumps after cold start | Step 1e: `build_dump_cmd` |
-| C3 | OPEN | Critical | `is_full_dump()` uses frozen `restored_depth` | Step 1a: use `len(self.entries)` |
-| C4 | RESOLVED | Critical | `IncrementalChain` not declared as global | Step 4a |
-| C5 | RESOLVED | Critical | Restored checkpoint path not carried to `after_request()` | Step 4a |
-| H1 | RESOLVED | High | `max_chain_depth` propagation inconsistent | Steps 2c + 3a |
-| H2 | OPEN | High | `Checkpoint.delete()` has no chain guard | Step 5c (documented) |
-| H3 | RESOLVED | High | `clear_soft_dirty` PID timing in `init()` | Step 4b |
-| H4 | RESOLVED | High | Dump output dir not cleaned before use | Step 4c |
-| M1 | RESOLVED | Medium | Pool serialization format unspecified | Steps 3a + 4b |
-| M2 | OPEN | Medium | Mixed pool transition not addressed | Step 5 (verify in testing) |
+| #   | Status   | Severity | Issue                                                          | Fix location                     |
+| --- | -------- | -------- | -------------------------------------------------------------- | -------------------------------- |
+| C1  | RESOLVED | Critical | `cr_deserialize` doesn't parse `incremental`/`max_chain_depth` | Step 2                           |
+| C2  | OPEN     | Critical | `--track-mem` missing on full dumps after cold start           | Step 1e: `build_dump_cmd`        |
+| C3  | OPEN     | Critical | `is_full_dump()` uses frozen `restored_depth`                  | Step 1a: use `len(self.entries)` |
+| C4  | RESOLVED | Critical | `IncrementalChain` not declared as global                      | Step 4a                          |
+| C5  | RESOLVED | Critical | Restored checkpoint path not carried to `after_request()`      | Step 4a                          |
+| H1  | RESOLVED | High     | `max_chain_depth` propagation inconsistent                     | Steps 2c + 3a                    |
+| H2  | OPEN     | High     | `Checkpoint.delete()` has no chain guard                       | Step 5c (documented)             |
+| H3  | RESOLVED | High     | `clear_soft_dirty` PID timing in `init()`                      | Step 4b                          |
+| H4  | RESOLVED | High     | Dump output dir not cleaned before use                         | Step 4c                          |
+| M1  | RESOLVED | Medium   | Pool serialization format unspecified                          | Steps 3a + 4b                    |
+| M2  | OPEN     | Medium   | Mixed pool transition not addressed                            | Step 5 (verify in testing)       |
 
 ---
 
 ## CRIU Flag Reference
 
-| Flag | Purpose |
-|------|---------|
-| `--prev-images-dir <rel_path>` | Path (relative to `-D`) to parent checkpoint images |
-| `--track-mem` | Enable kernel memory change tracking for subsequent incremental dumps |
-| `--leave-running` | Keep process alive after dump (already used) |
-| `--tcp-established` | Dump TCP connections (already used) |
-| `--restore-detached` | Restore in background (already used) |
+| Flag                           | Purpose                                                               |
+| ------------------------------ | --------------------------------------------------------------------- |
+| `--prev-images-dir <rel_path>` | Path (relative to `-D`) to parent checkpoint images                   |
+| `--track-mem`                  | Enable kernel memory change tracking for subsequent incremental dumps |
+| `--leave-running`              | Keep process alive after dump (already used)                          |
+| `--tcp-established`            | Dump TCP connections (already used)                                   |
+| `--restore-detached`           | Restore in background (already used)                                  |
 
 Sources: [CRIU Incremental Dumps](https://criu.org/Incremental_dumps), [CRIU Man Page](https://manpages.debian.org/unstable/criu/criu.8.en.html), [CRIU Memory Changes Tracking](https://criu.org/Memory_changes_tracking)
+
+---
+
+## Post-Experiment Optimizations (agent-python)
+
+After running BFS and dynamic-html benchmarks, the incremental delta system was observed to produce deltas nearly as large as full dumps (PyPy JIT + heavy library allocations dirty most of the heap each request) and accumulated slightly more storage than baseline Pronghorn due to chain-integrity constraints preventing aggressive pruning. Three targeted optimizations were implemented.
+
+### Opt 1 — Size-threshold guard
+
+**Files:** `agent-python/incremental.py`, `agent-python/main.py`
+
+**Problem:** When deltas are nearly as large as full dumps (>80% of full dump page size), they consume the same storage but impose higher restore latency (multiple MinIO fetches instead of one). The system blindly continues chaining even when there is no benefit.
+
+**Fix:** After every CRIU dump, `IncrementalChain.record_dump(entry_dir, was_full)` compares the dump's `pages-*.img` size against the stored `last_full_dump_size`. If the delta ratio exceeds `SIZE_RATIO_THRESHOLD = 0.80`, `_force_full_next` is set. The next call to `is_full_dump()` returns True, starting a fresh chain. The baseline is updated after every full dump and cleared when the chain resets.
+
+**Where called:** `agent-python/main.py` `after_request()`, immediately after `chain.upload_entry()`.
+
+### Opt 2 — Chain depth discount in pool scoring
+
+**File:** `agent-python/orchestration/strategies/request_centric.py`
+
+**Problem:** The chain-aware pruner scores each chain by aggregate expected value (root + all descendants equally weighted). Deep chains always score at least as high as shallow ones because more descendants means more total weight. This biases the pruner toward retaining long chains and against starting fresh full dumps, resulting in the pool filling with deep chains that each consume `max_chain_depth` slots and limit pool diversity.
+
+**Fix:** `_weights_for_chain()` now applies a per-depth discount `CHAIN_DEPTH_DISCOUNT = 0.9` to each node's contribution: a child at depth `d` contributes `weight × 0.9^d`. The root is unaffected (depth 0). This means a depth-5 chain's deepest leaf contributes `~0.66×` of its undiscounted value, making shallow chains (more fresh full-dump roots) comparatively attractive during pruning. The constant is a class-level tunable.
+
+### Opt 4 — Post-restore dirty-rate sampling
+
+**Files:** `agent-python/incremental.py`, `agent-python/main.py`
+
+**Problem:** For workloads like PyPy + networkx/jinja2, incremental mode is fundamentally ineffective because the runtime continuously dirties a large fraction of the heap. Currently the system only discovers this after many wasted incremental dumps. The optimizer should detect write-heavy workloads early and preemptively use full dumps.
+
+**Fix — measurement:** `IncrementalChain.count_soft_dirty_ratio(pid)` reads `/proc/{pid}/maps` to enumerate mapped regions and `/proc/{pid}/pagemap` (bit 55 = kernel soft-dirty) to count dirty vs total pages. Returns a float in [0, 1]; returns 1.0 on any error (conservative).
+
+**Fix — trigger:** `clear_soft_dirty()` now sets `self.pending_dirty_check = True`. After the first request following a restore, `main.py` calls `chain.check_dirty_rate(pid)`. If the dirty ratio exceeds `DIRTY_RATE_THRESHOLD = 0.70`, `_force_full_next` is set, causing the next `is_full_dump()` call to return True. The check fires at most once per container lifecycle (flag is cleared after measurement).
+
+**Where called:** `agent-python/main.py` `after_request()`, at the top of the function before the `on_container_request()` call, so the decision is available before any dump is triggered.
+
+### Interaction between Opt 1, 2, and 4
+
+The three optimizations are complementary and non-conflicting:
+- Opt 4 fires first (post-restore, before any dump). If the workload is write-heavy, Opt 4 forces a full dump immediately on the first checkpoint opportunity, and Opt 1 will then record that full dump as the new baseline.
+- Opt 1 fires on subsequent dumps if a delta slips through (e.g., Opt 4 didn't fire because dirty rate was borderline but the actual delta turned out large).
+- Opt 2 operates continuously in the orchestrator, independent of the agent, biasing the pool toward shallower chains regardless of whether Opt 1 or 4 have fired.
+
+All three share the same `_force_full_next` flag in `IncrementalChain`, so they compose naturally.

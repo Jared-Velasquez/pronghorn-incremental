@@ -14,3 +14,4 @@ test/
 **/.DS_Store
 .gradle/
 **/bin/
+plots/

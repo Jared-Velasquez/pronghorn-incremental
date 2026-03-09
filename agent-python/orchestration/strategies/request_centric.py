@@ -7,6 +7,12 @@ import copy
 
 DEFAULT_MAX_CAPACITY = 14
 
+# Opt 2: Each additional level of chain depth discounts that node's contribution
+# to the chain's aggregate score by this factor.  A chain of depth 5 has its
+# deepest leaf weighted at 0.9^4 ≈ 0.66×, making the pruner prefer shallower
+# chains and naturally limiting unbounded depth growth.
+CHAIN_DEPTH_DISCOUNT = 0.9
+
 DEFAULT_P = 0.40
 DEFAULT_GAMMA = 0.10
 
@@ -59,16 +65,20 @@ class RequestCentricStrategy(CRStrategy):
         return output
 
     def _weights_for_chain(self, root_chkpt: Checkpoint):
-        # Weights = Weights over root + all subsequent children in the chain 
+        # Opt 2: apply a per-depth discount so deeper chains score lower,
+        # biasing the pruner toward shallower chains and fresh full dumps.
+        # Root is at depth 0 (no discount); each child level multiplies by
+        # CHAIN_DEPTH_DISCOUNT.
         total_weight = self._weights_for(root_chkpt.state.request_number, scalar=True)
-        stack = [root_chkpt]
+        stack = [(root_chkpt, 1)]  # (checkpoint, child_depth)
 
         while stack:
-            current = stack.pop()
-            # Brute force find children of checkpoints in pool 
-            for child in [c for c in self.pool if c.parent_path == current.path]: 
-                total_weight += self._weights_for(child.state.request_number, scalar=True)
-                stack.append(child)
+            current, depth = stack.pop()
+            # Brute force find children of checkpoints in pool
+            for child in [c for c in self.pool if c.parent_path == current.path]:
+                child_weight = self._weights_for(child.state.request_number, scalar=True)
+                total_weight += child_weight * (CHAIN_DEPTH_DISCOUNT ** depth)
+                stack.append((child, depth + 1))
         return total_weight
 
     def _prune_pool(self):
